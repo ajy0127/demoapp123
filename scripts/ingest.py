@@ -32,10 +32,10 @@ AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID", "")
 ASSESSMENT_ID = os.environ.get("AUDIT_MANAGER_ASSESSMENT_ID", "")
 
 CONTROL_MAP = {
-    "sast":       ["SA-11", "SA-15"],
-    "dependency": ["SI-2",  "SA-12"],
-    "container":  ["CM-7",  "SI-3",  "CM-6"],
-    "dast":       ["CA-8",  "SA-11"],
+    "sast":       ["3.11.2", "3.14.1"],
+    "dependency": ["3.11.2", "3.14.1"],
+    "container":  ["3.11.2", "3.14.2", "3.14.5"],
+    "dast":       ["3.12.1", "3.12.3"],
 }
 
 SEVERITY_MAP = {
@@ -148,25 +148,23 @@ def _from_bandit(raw, repo, commit, run_id):
 
 
 def _from_semgrep(raw, repo, commit, run_id):
-    runs = raw.get("runs", [])
+    results = raw.get("results", [])
     findings = []
-    for run in runs:
-        for r in run.get("results", []):
-            sev_raw = r.get("properties", {}).get("severity", "medium").upper()
-            sev = SEVERITY_MAP.get(sev_raw, "MEDIUM")
-            base = _asff_base("semgrep", repo, commit, run_id)
-            msg = r.get("message", {})
-            text = msg.get("text", "") if isinstance(msg, dict) else str(msg)
-            loc = r.get("locations", [{}])[0]
-            uri = loc.get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "unknown")
-            base.update({
-                "Id":          _finding_id("semgrep", f"{uri}:{r.get('ruleId','')}"),
-                "Title":       f"[Semgrep] {r.get('ruleId', 'Rule violation')}",
-                "Description": text[:1024],
-                "Severity":    {"Label": sev},
-                "Types":       ["Software and Configuration Checks/Vulnerabilities/CVE"],
-            })
-            findings.append(base)
+    for r in results:
+        extra = r.get("extra", {})
+        sev_raw = extra.get("severity", "WARNING").upper()
+        sev = SEVERITY_MAP.get(sev_raw, "MEDIUM")
+        base = _asff_base("semgrep", repo, commit, run_id)
+        path = r.get("path", "unknown")
+        check_id = r.get("check_id", "")
+        base.update({
+            "Id":          _finding_id("semgrep", f"{path}:{check_id}"),
+            "Title":       f"[Semgrep] {check_id}",
+            "Description": extra.get("message", "")[:1024],
+            "Severity":    {"Label": sev},
+            "Types":       ["Software and Configuration Checks/Vulnerabilities/CVE"],
+        })
+        findings.append(base)
     return findings
 
 
@@ -395,6 +393,9 @@ def _summarize(scan_type, tool, raw):
     if tool == "zap":
         alerts = sum(len(s.get("alerts", [])) for s in raw.get("site", []))
         return {"total_alerts": alerts}
+    if tool == "semgrep":
+        results = raw.get("results", [])
+        return {"total_findings": len(results)}
     return {"raw_keys": list(raw.keys()) if isinstance(raw, dict) else []}
 
 
