@@ -217,7 +217,7 @@ jobs:
       - name: Run Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
-            sh -s -- -b /usr/local/bin v0.59.1
+            sh -s -- -b /usr/local/bin
           trivy image \
             --format json \
             --output trivy-results.json \
