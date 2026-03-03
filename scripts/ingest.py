@@ -267,15 +267,9 @@ def push_to_audit_manager(scan_type, tool, file_path, raw, repo, commit, run_id)
 
     control_sets = assessment["assessment"]["framework"].get("controlSets", [])
 
-    evidence_text = json.dumps({
-        "tool":       tool,
-        "scan_type":  scan_type,
-        "repository": repo,
-        "commit":     commit,
-        "run_id":     str(run_id),
-        "timestamp":  datetime.datetime.utcnow().isoformat(),
-        "summary":    _summarize(scan_type, tool, raw),
-    }, indent=2)
+    summary   = _summarize(scan_type, tool, raw)
+    compliant = _is_compliant(scan_type, summary)
+    timestamp = datetime.datetime.utcnow()
 
     imported = 0
     for cs in control_sets:
@@ -283,24 +277,103 @@ def push_to_audit_manager(scan_type, tool, file_path, raw, repo, commit, run_id)
         for ctrl in cs.get("controls", []):
             ctrl_id   = ctrl["id"]
             ctrl_name = ctrl.get("name", "")
-            if any(nc.replace("-", " ") in ctrl_name.upper() or nc in ctrl_name.upper()
-                   for nc in nist_controls):
-                try:
-                    am.batch_import_evidence_to_assessment_control(
-                        assessmentId=ASSESSMENT_ID,
-                        controlSetId=cs_id,
-                        controlId=ctrl_id,
-                        manualEvidence=[{"textResponse": evidence_text[:2048]}],
-                    )
-                    imported += 1
-                    print(f"[ingest] AuditManager: evidence imported to {ctrl_name} ({ctrl_id})")
-                except ClientError as e:
-                    print(f"[ingest] AuditManager import error for {ctrl_id}: {e}")
+            if not any(nc.replace("-", " ") in ctrl_name.upper() or nc in ctrl_name.upper()
+                       for nc in nist_controls):
+                continue
+
+            evidence_text = _format_evidence_text(
+                tool=tool,
+                scan_type=scan_type,
+                repo=repo,
+                commit=commit,
+                run_id=run_id,
+                ctrl_name=ctrl_name,
+                ctrl_id=ctrl_id,
+                summary=summary,
+                compliant=compliant,
+                timestamp=timestamp,
+            )
+            try:
+                am.batch_import_evidence_to_assessment_control(
+                    assessmentId=ASSESSMENT_ID,
+                    controlSetId=cs_id,
+                    controlId=ctrl_id,
+                    manualEvidence=[{"textResponse": evidence_text[:2048]}],
+                )
+                imported += 1
+                status = "COMPLIANT" if compliant else "NON_COMPLIANT"
+                print(f"[ingest] AuditManager: {status} evidence → {ctrl_name} ({ctrl_id})")
+            except ClientError as e:
+                print(f"[ingest] AuditManager import error for {ctrl_id}: {e}")
 
     if imported == 0:
         print(f"[ingest] AuditManager: no matching controls found for {nist_controls}")
     else:
         print(f"[ingest] AuditManager: imported evidence to {imported} controls")
+
+
+def _format_evidence_text(tool, scan_type, repo, commit, run_id, ctrl_name,
+                          ctrl_id, summary, compliant, timestamp):
+    """Build structured evidence text matching Audit Manager manual evidence format."""
+    tool_label = tool.upper().replace("-", "_")
+    test_status = "PASS" if compliant else "FAIL"
+    compliance_status = "COMPLIANT" if compliant else "NON_COMPLIANT"
+
+    findings_line = _findings_sentence(tool, summary)
+
+    return (
+        f"Evidence Source: GitHub Actions CI/CD\n"
+        f"Description: Automated CI/CD security testing: "
+        f"{scan_type.upper()} scan using {tool}\n"
+        f"Scanner: {tool_label}\n"
+        f"Repository: {repo}\n"
+        f"Commit: {commit[:12]}\n"
+        f"Run ID: {run_id}\n"
+        f"Control: {ctrl_name}\n"
+        f"Test Status: {test_status}\n"
+        f"Date: {timestamp.isoformat()}+00:00\n"
+        f"{findings_line}\n"
+        f"Control ID: {ctrl_id}\n"
+        f"Compliance Status: {compliance_status}\n"
+        f"Timestamp: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+
+def _findings_sentence(tool, summary):
+    """Return a human-readable one-liner describing scan findings."""
+    if tool == "bandit":
+        total = summary.get("total", 0)
+        high  = summary.get("high", 0)
+        if total == 0:
+            return "No security issues found."
+        return (f"{total} issue(s) found: {high} HIGH, "
+                f"{summary.get('medium',0)} MEDIUM, {summary.get('low',0)} LOW.")
+    if tool in ("pip-audit", "pip_audit"):
+        n = summary.get("total_vulnerabilities", 0)
+        return "No known vulnerabilities found." if n == 0 else f"{n} vulnerable package(s) found."
+    if tool == "trivy":
+        n = summary.get("total_vulnerabilities", 0)
+        return "No fixable vulnerabilities found." if n == 0 else f"{n} container vulnerability(ies) found (CRITICAL/HIGH/MEDIUM)."
+    if tool == "zap":
+        n = summary.get("total_alerts", 0)
+        return "No web application vulnerabilities found." if n == 0 else f"{n} web application alert(s) found."
+    if tool == "semgrep":
+        n = summary.get("total_findings", 0)
+        return "No rule violations found." if n == 0 else f"{n} rule violation(s) found."
+    return "Scan completed."
+
+
+def _is_compliant(scan_type, summary):
+    """Return True (COMPLIANT) if no high/critical findings."""
+    if "high" in summary and summary["high"] > 0:
+        return False
+    if "total_vulnerabilities" in summary and summary["total_vulnerabilities"] > 0:
+        return False
+    if "total_alerts" in summary and summary["total_alerts"] > 0:
+        return False
+    if "total_findings" in summary and summary["total_findings"] > 0:
+        return False
+    return True
 
 
 def _summarize(scan_type, tool, raw):
