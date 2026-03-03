@@ -1,0 +1,292 @@
+name: GRC Evidence Pipeline - Security Scans
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'scripts/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: nrlabs-grc-demo-app
+  APP_URL: http://3.221.97.145:5000
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build and push Docker image to ECR
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE=$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker build -t $IMAGE ./app
+          docker tag $IMAGE $REGISTRY/$ECR_REPOSITORY:latest
+          docker push $IMAGE
+          docker push $REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # SAST - Bandit (Python static analysis)
+  # ---------------------------------------------------------------------------
+  sast-bandit:
+    name: SAST - Bandit (Python)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: pip install bandit[toml] boto3
+
+      - name: Run Bandit
+        run: bandit -r app/ -f json -o bandit-results.json || true
+
+      - name: Ingest results
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AUDIT_MANAGER_ASSESSMENT_ID: ${{ secrets.AUDIT_MANAGER_ASSESSMENT_ID }}
+        run: |
+          python scripts/ingest.py \
+            --type sast --tool bandit --file bandit-results.json \
+            --repo ${{ github.repository }} \
+            --commit ${{ github.sha }} \
+            --run-id ${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bandit-results
+          path: bandit-results.json
+
+  # ---------------------------------------------------------------------------
+  # SAST - Semgrep
+  # ---------------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST - Semgrep
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: pip install semgrep boto3
+
+      - name: Run Semgrep
+        run: semgrep --config=p/python --json --output semgrep-results.json app/ || true
+
+      - name: Ingest results
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AUDIT_MANAGER_ASSESSMENT_ID: ${{ secrets.AUDIT_MANAGER_ASSESSMENT_ID }}
+        run: |
+          python scripts/ingest.py \
+            --type sast --tool semgrep --file semgrep-results.json \
+            --repo ${{ github.repository }} \
+            --commit ${{ github.sha }} \
+            --run-id ${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+
+  # ---------------------------------------------------------------------------
+  # Dependency scan - pip-audit
+  # ---------------------------------------------------------------------------
+  dependency-scan:
+    name: Dependency Scan - pip-audit
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: pip install pip-audit boto3
+
+      - name: Run pip-audit
+        run: pip-audit -r app/requirements.txt -f json -o pip-audit-results.json || true
+
+      - name: Ingest results
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AUDIT_MANAGER_ASSESSMENT_ID: ${{ secrets.AUDIT_MANAGER_ASSESSMENT_ID }}
+        run: |
+          python scripts/ingest.py \
+            --type dependency --tool pip-audit --file pip-audit-results.json \
+            --repo ${{ github.repository }} \
+            --commit ${{ github.sha }} \
+            --run-id ${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-results
+          path: pip-audit-results.json
+
+  # ---------------------------------------------------------------------------
+  # Container scan - Trivy
+  # ---------------------------------------------------------------------------
+  container-scan-trivy:
+    name: Container Scan - Trivy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image }}
+          format: json
+          output: trivy-results.json
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Ingest results
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AUDIT_MANAGER_ASSESSMENT_ID: ${{ secrets.AUDIT_MANAGER_ASSESSMENT_ID }}
+        run: |
+          python scripts/ingest.py \
+            --type container --tool trivy --file trivy-results.json \
+            --repo ${{ github.repository }} \
+            --commit ${{ github.sha }} \
+            --run-id ${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.json
+
+  # ---------------------------------------------------------------------------
+  # DAST - OWASP ZAP (against live EC2 instance)
+  # ---------------------------------------------------------------------------
+  dast-zap:
+    name: DAST - OWASP ZAP
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Wait for app to be reachable
+        run: |
+          for i in $(seq 1 12); do
+            curl -sf ${{ env.APP_URL }}/health && break || echo "Waiting... ($i/12)"
+            sleep 10
+          done
+
+      - name: Run ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: ${{ env.APP_URL }}
+          cmd_options: '-J zap-results.json'
+
+      - name: Ingest results
+        if: always()
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AUDIT_MANAGER_ASSESSMENT_ID: ${{ secrets.AUDIT_MANAGER_ASSESSMENT_ID }}
+        run: |
+          python scripts/ingest.py \
+            --type dast --tool zap --file zap-results.json \
+            --repo ${{ github.repository }} \
+            --commit ${{ github.sha }} \
+            --run-id ${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-results
+          path: zap-results.json
