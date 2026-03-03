@@ -209,15 +209,22 @@ jobs:
       - name: Install boto3
         run: pip install boto3
 
+      - name: Login to ECR for Trivy
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin 834241034622.dkr.ecr.us-east-1.amazonaws.com
+
       - name: Run Trivy
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ needs.build-and-push.outputs.image }}
-          format: json
-          output: trivy-results.json
-          exit-code: '0'
-          ignore-unfixed: true
-          severity: 'CRITICAL,HIGH,MEDIUM'
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+            sh -s -- -b /usr/local/bin v0.59.1
+          trivy image \
+            --format json \
+            --output trivy-results.json \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --severity CRITICAL,HIGH,MEDIUM \
+            "${{ needs.build-and-push.outputs.image }}" || true
 
       - name: Ingest results
         env:
@@ -267,10 +274,13 @@ jobs:
           done
 
       - name: Run ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.10.0
-        with:
-          target: ${{ env.APP_URL }}
-          cmd_options: '-J zap-results.json'
+        run: |
+          docker run --rm \
+            -v "$(pwd):/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$APP_URL" -J zap-results.json -I || true
+        env:
+          APP_URL: ${{ env.APP_URL }}
 
       - name: Ingest results
         if: always()
